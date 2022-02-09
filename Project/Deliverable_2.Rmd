@@ -6,23 +6,87 @@ output: html_document
 ---
 
 ```{r setup, include=FALSE}
+library(plyr)
+library(dplyr)
 library(data.table)
 library(ggplot2)
 
+library(cluster)
+
+library(factoextra)
 ```
 
 ## Cluster Analysis
 
-```{r cars}
-summary(cars)
+```{r collecting, eval=T}
+rds_link <- 'https://github.com/varshaskrish/comp-thinking/raw/main/Project/alldata_long_OK_SNAP_DOH.RDS'
+rds_data <- url(rds_link)
+
+#read in data
+py_data <- readRDS(file = rds_data)
+
 ```
 
-## Including Plots
 
-You can also embed plots, for example:
+## Prepare data
+Test the distribution of the data by county, year (box plot for pui and he) 
+```{r, copy_clean_data}
+## create a copy of the dataset
+dataTest <- as.data.table(copy(py_data))
 
-```{r pressure, echo=FALSE}
-plot(pressure)
+## clean the dataset for clustering use
+setnames(dataTest, old = c("Population (2020)", 
+                           "WA_adults_cost_prohibited_healthcare_access_pct_2019_bycounty",
+                           "WA_adults_flu_shot_pct_2019_bycounty",
+                           "WA_adult_poor_mental_health_pct_2019_bycounty",
+                           "WA_adult_binge_drinking_pct_2019_bycounty", 
+                           "WA_maternal_smoking_pct_2019_bycounty"), 
+         
+         new = c("pop_2020", 
+                 "cost_of_care", "flu_shot", "menatl_health", "binge_drinking", "maternal_smoke"))
+
+### only use the 2019 data
+dataTest <- dataTest[year == 2019]
+
+### transform the SNAP number households and percent uninsured to per-capita rates
+dataTest[, snap_pc := (snap/pop_2020)*100]
+
+### remove uneeded cols
+dataTest <- dataTest[, c('year', 'pop_2020', 'snap'):=NULL]
+
+# REMOVE HOUSEHOLD INCOME AND FLU SHOT
+dataTest <- dataTest[, c('he', 'flu_shot'):=NULL]
+
+## set the county names as row names and remove the numeric household income est
+dataTest <- as.data.frame(dataTest) #only dataframes get rownames
+
+row.names(dataTest)=dataTest$County
+dataTest$County=NULL
 ```
 
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+Test the distribtuion of the two per-capita variables
+```{r, dis_plot1}
+boxplot(dataTest, horizontal = T, cex.axis = 0.5, las=1)
+```
+
+
+## Computing the Distance Matrix
+```{r, dis_matx}
+dataToCluster <- copy(dataTest)
+
+## set a random seed
+set.seed(999)
+
+## pick a distance method and compute distance matrix
+dataToCluster_DM=daisy(x=dataToCluster, metric = "gower")
+
+```
+
+```{r}
+fviz_nbclust(dataToCluster, 
+             pam,
+             diss=dataToCluster_DM,
+             method = "gap_stat",
+             k.max = 10,
+             verbose = F) #agnes 
+```
