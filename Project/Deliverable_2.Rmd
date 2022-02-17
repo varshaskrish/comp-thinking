@@ -5,15 +5,38 @@ date: "1/27/2022"
 output: html_document
 ---
 
-```{r setup, include=FALSE}
+```{r setup, include=FALSE, error=FALSE, warning=FALSE, message=FALSE}
+#standard packages
 library(plyr)
 library(dplyr)
 library(data.table)
 library(ggplot2)
+library(grid)
+library(gridExtra)
+library(ggrepel)
 
+#cluster and factor analysis 
 library(cluster)
-
 library(factoextra)
+library(qpcR)
+
+library(lavaan)
+library(scales)
+
+#regression analysis 
+library(rsq)
+library(lmtest)
+library(car)
+library(sjPlot)
+library(caret)
+library(margins)
+
+# user defined functions
+g_legend<-function(a.gplot){
+  tmp <- ggplot_gtable(ggplot_build(a.gplot))
+  leg <- which(sapply(tmp$grobs, function(x) x$name) == "guide-box")
+  legend <- tmp$grobs[[leg]]
+  return(legend)}
 ```
 
 ## Cluster Analysis
@@ -29,33 +52,46 @@ py_data <- readRDS(file = rds_data)
 
 
 ## Prepare data
-Test the distribution of the data by county, year (box plot for pui and he) 
+The datais structured correctly from Python but some of the variable names still need a little editing so they will display nicely in figures and are all the same unit. 
 ```{r, copy_clean_data}
 ## create a copy of the dataset
-dataTest <- as.data.table(copy(py_data))
+dataTest_full <- as.data.table(copy(py_data))
 
 ## clean the dataset for clustering use
-setnames(dataTest, old = c("Population (2020)", 
+setnames(dataTest_full, old = c("Population (2020)", 
                            "WA_adults_cost_prohibited_healthcare_access_pct_2019_bycounty",
                            "WA_adults_flu_shot_pct_2019_bycounty",
                            "WA_adult_poor_mental_health_pct_2019_bycounty",
                            "WA_adult_binge_drinking_pct_2019_bycounty", 
-                           "WA_maternal_smoking_pct_2019_bycounty"), 
+                           "WA_maternal_smoking_pct_2019_bycounty", 
+                           "WA_women_early_prenatal_care_access_pct_2019_bycounty", 
+                           "WA_adults_with_personal_health_care_provider_pct_2019_bycounty"), 
          
          new = c("pop_2020", 
-                 "cost_of_care", "flu_shot", "menatl_health", "binge_drinking", "maternal_smoke"))
+                 "cost_of_care", "flu_shot", "mental_health", "binge_drinking", "maternal_smoke", "prenatal_care", "PCP_access"))
 
 ### only use the 2019 data
-dataTest <- dataTest[year == 2019]
+dataTest_full <- dataTest_full[year == 2019]
 
 ### transform the SNAP number households and percent uninsured to per-capita rates
-dataTest[, snap_pc := (snap/pop_2020)*100]
+dataTest_full[, snap_pc := (snap/pop_2020)*100]
 
+## transfor the primary care access to no primary care access 
+dataTest_full[, noPCP_access := 100-PCP_access]
+
+# create a new dataframe for later use
+dataMap <- copy(dataTest_full)
+```
+
+Test the distribution of the data by county, year for NEGATIVE indicators of health equity (.i.e. measures that have a negative effect on health)
+```{r}
 ### remove uneeded cols
+dataTest <- copy(dataTest_full)
+
 dataTest <- dataTest[, c('year', 'pop_2020', 'snap'):=NULL]
 
 # REMOVE HOUSEHOLD INCOME AND FLU SHOT
-dataTest <- dataTest[, c('he', 'flu_shot'):=NULL]
+dataTest <- dataTest[, c('he','flu_shot', 'prenatal_care', 'PCP_access', 'noPCP_access'):=NULL]
 
 ## set the county names as row names and remove the numeric household income est
 dataTest <- as.data.frame(dataTest) #only dataframes get rownames
@@ -68,7 +104,7 @@ Test the distribtuion of the two per-capita variables
 ```{r, dis_plot1}
 boxplot(dataTest, horizontal = T, cex.axis = 0.5, las=1)
 ```
-
+This looks good -- all the chosen measures have approdimately similar distributions.
 
 ## Computing the Distance Matrix
 ```{r, dis_matx}
@@ -82,11 +118,478 @@ dataToCluster_DM=daisy(x=dataToCluster, metric = "gower")
 
 ```
 
+## Test clustering models
 ```{r}
 fviz_nbclust(dataToCluster, 
              pam,
              diss=dataToCluster_DM,
              method = "gap_stat",
              k.max = 10,
-             verbose = F) #agnes 
+             verbose = F) 
 ```
+
+```{r}
+fviz_nbclust(dataToCluster, 
+             hcut,
+             diss=dataToCluster_DM,
+             method = "gap_stat",
+             k.max = 5,
+             verbose = F,
+             hc_func = "agnes")
+```
+
+```{r}
+fviz_nbclust(dataToCluster, 
+             hcut,
+             diss=dataToCluster_DM,
+             method = "gap_stat",
+             k.max = 10,
+             verbose = F,
+             hc_func = "diana")
+```
+Both the Pam and Diana clustering functions suggested using 2 clusters...   
+This makes sense with what we know about health outcomes in WA state (Eastern WA and Western WA have distinct health profiles)
+  
+   
+Now apply the clustering function...
+```{r}
+NumberOfClusterDesired=2
+
+# Partitioning technique
+res.pam = pam(x=dataToCluster_DM,
+              k = NumberOfClusterDesired,
+              cluster.only = F)
+
+# Hierarchical technique- agglomerative approach
+res.agnes = hcut(dataToCluster_DM, 
+                k = NumberOfClusterDesired,
+                isdiss=TRUE,
+                hc_func='agnes',
+                hc_method = "ward.D2")
+
+# Hierarchical technique- divisive approach
+res.diana = hcut(dataToCluster_DM, 
+                k = NumberOfClusterDesired,
+                isdiss=TRUE,
+                hc_func='diana',
+                hc_method = "ward.D2")
+```
+
+### Add results back to the original full dataframe
+```{r}
+dataMap$pam=as.factor(res.pam$clustering)
+dataMap$agn=as.factor(res.agnes$cluster)
+dataMap$dia=as.factor(res.diana$cluster)
+
+
+## verify the ordinatliy -- not really necessary with 2 clusters??
+aggregate(data=dataMap, pui~pam, FUN=mean)
+aggregate(data=dataMap, pui~agn, FUN=mean)
+aggregate(data=dataMap, pui~dia, FUN=mean)
+```
+
+
+## Evaluate results.
+### Plot silhouettes
+```{r}
+fviz_silhouette(res.pam)
+```
+
+```{r}
+fviz_silhouette(res.agnes)
+```
+
+```{r}
+fviz_silhouette(res.diana)
+```
+Of the three clustering stratigies, the Diana function best captured the data with only 1 negative sihouette. The Agnes function was the worset model at capturing theses data in clusters. 
+  
+  
+## Compare the clustering 
+
+First keep all the negative sihouette counties
+```{r}
+#pull clustering data into a dataframe 
+pamEval=data.frame(res.pam$silinfo$widths)
+agnEval=data.frame(res.agnes$silinfo$widths)
+diaEval=data.frame(res.diana$silinfo$widths)
+
+#filter out only the negative sil locs
+pamPoor=rownames(pamEval[pamEval$sil_width<0,])
+agnPoor=rownames(agnEval[agnEval$sil_width<0,])
+diaPoor=rownames(diaEval[diaEval$sil_width<0,])
+```
+
+```{r}
+neg_Clus <- as.data.frame(qpcR:::cbind.na(sort(pamPoor), sort(agnPoor),sort(diaPoor)))
+names(neg_Clus) = c("pam","agn","dia")
+
+#see all the poorly clustered locs
+neg_Clus
+```
+As noted above, Diana had only 1 negative silhouette whereas Agness had 6.   
+  
+  
+Now map the distances to compare the three different clustering models
+```{r}
+#use the distance matrix data from earlier
+projectedData <- cmdscale(dataToCluster_DM, k=2)
+
+dataMap$dim1 <- projectedData[,1]
+dataMap$dim2 <- projectedData[,2]
+
+# map
+baseMap <- ggplot(data=dataMap, 
+               aes(x=dim1, y=dim2, label=County)) + 
+  geom_text(size=2) + 
+  theme_bw()
+
+baseMap
+```
+
+Now color the counties by their cluster for each of the 3 models and add location name annotations
+```{r}
+pamMap = baseMap + 
+  labs(title = "PAM") + 
+  geom_point(size=2, aes(color=pam)) + 
+  theme(legend.position = 'bottom', legend.title = element_blank())
+
+map_leg <- g_legend(pamMap)
+pamMap <- pamMap + theme(legend.position = 'none')
+
+agnMap = baseMap + 
+  labs(title = "AGNES") + 
+  geom_point(size=2, aes(color=agn), show.legend = F)
+
+diaMap = baseMap + 
+  labs(title = "DIANA") + 
+  geom_point(size=2, aes(color=dia), show.legend = F)
+
+
+grid.arrange(arrangeGrob(pamMap, agnMap, diaMap, nrow= 1), map_leg, nrow=2, heights = c(10,1))
+```
+
+Annotate only the outlier counties
+```{r}
+LABELpam=ifelse(dataMap$County %in% pamPoor, dataMap$County, "")
+LABELagn=ifelse(dataMap$County %in% agnPoor, dataMap$County, "")
+LABELdia=ifelse(dataMap$County %in% diaPoor, dataMap$County, "")
+```
+
+```{r}
+#remove the text labels for all counties and add in only the poor mapped loc naems 
+pamMap$layers <- pamMap$layers[2]
+pamMap<- pamMap + geom_text_repel(aes(label=LABELpam))
+
+agnMap$layers <- agnMap$layers[2]
+agnMap<- agnMap + geom_text_repel(aes(label=LABELagn))
+
+diaMap$layers <- diaMap$layers[2]
+diaMap<- diaMap + geom_text_repel(aes(label=LABELdia))
+
+grid.arrange(arrangeGrob(pamMap, agnMap, diaMap, nrow= 1), map_leg, nrow=2, heights = c(10,1))
+```
+
+Also can look at this clustering through a Dendogram visual approach: 
+```{r}
+fviz_dend(res.agnes,k=NumberOfClusterDesired, cex = 0.45, horiz = T,main = "AGNES approach")
+```
+```{r}
+fviz_dend(res.diana,k=NumberOfClusterDesired, cex = 0.45, horiz = T,main = "DIANA approach")
+```
+
+## Factor Analysis
+```{r}
+dataforFA <- copy(dataTest)
+setDT(dataforFA, keep.rownames = 'County')
+```
+
+```{r}
+model='healthequ=~cost_of_care + mental_health + binge_drinking + maternal_smoke + snap_pc' ## snap_pc removed for sake of variance from other indicators
+
+fit <- cfa(model, data = dataforFA, std.lv=TRUE)
+indexCFA = lavPredict(fit)
+
+#indexCFANorm[1:10]
+
+# rescale the values from 0 to 100 to match the Percent Uninsured Access
+indexCFANorm <- rescale(as.vector(indexCFA), to = c(0, 100))
+indexCFANorm[1:10]
+```
+```{r}
+dataMap$demo_FA <- indexCFANorm
+
+base_FA <- ggplot(data=dataMap, aes(x=demo_FA, y=pui)) +
+  geom_point()
+
+base_FA
+```
+When lookign at the outcomes of this factor analysis, it looks like there are not enough data to conclusively suggest that lack of health insurance (pui) can reliably predict a set of negative health outcomes (demo_FA). 
+  
+  
+## Regression Analysis
+
+### Explainatory Approach
+First: Test two hypotheses
+1. Hypothesis 1: no primary care access positvely coorelates with (increases) percent uninsured (only)
+2. Hypothesis 2: no primary care access positvely coorelates with (increases) percent uninsured and negative indicators of health equality (aka. five indicators better predict lack of access to primary care provider)
+
+Run regrssion models for both hypotheses
+```{r}
+# hypothesis 1
+hypo1 <- formula(pui~ noPCP_access)
+
+gauss1=glm(hypo1,
+           data = dataMap,
+           family = 'gaussian')
+
+# hypothesis 2
+hypo2 <- formula(pui~ noPCP_access + cost_of_care + mental_health + binge_drinking + maternal_smoke)
+
+gauss2=glm(hypo2,
+           data = dataMap,
+           family = 'gaussian')
+
+```
+
+Test Hypothesis 1
+```{r}
+summary(gauss1)
+```
+Test Hypothesis 2
+```{r}
+summary(gauss2)
+```
+
+Which of the 2 models is a better predictor for lack of access to PCP?
+```{r}
+anova(gauss1,gauss2,test="Chisq")
+```
+
+The **second test** is perhaps a better predictor...  
+Find the RSquared
+```{r}
+rsq(gauss1,adj=T)
+```
+and plot the model to see colinearity
+```{r}
+plot(gauss2,1)
+```
+  
+This model does not hold a clear linear relationship as higher percents of negative health outcomes (higher Predicted values). However, at lower percents it is relatively close. However, more data is needed to conclusively state a clear relationship. 
+  
+  
+#### Explore hypothesis 1: Resuidals and Homoscedasticity
+Are the residuals normal? 
+```{r}
+#visual representation
+plot(gauss2,2)
+```
+
+```{r}
+#mathmatical representation 
+shapiro.test(gauss2$residuals)
+```
+
+The residuals are fairly normally distriburted. (p value > 0.05)
+  
+    
+Now test for homoscedasticity (similar distribution of resudials along the predictors)
+```{r}
+#visual exploration
+plot(gauss2, 3)
+```
+
+```{r}
+#mathmatical representation
+bptest(gauss2)
+```
+We can assume Homoscedasticity because the  pvalue is >0.05. 
+  
+  
+    
+Let's assume that there is no colinearity here between the 5 indicators for negative health effects  
+```{r}
+vif(gauss2)
+```
+Since all values are < 5 we can confirm that there is no apparent colineratiy between these health effects with this data. 
+  
+  
+#### Outliers and Atypical Effects
+First look to see what points may be outliers
+```{r}
+plot(gauss2,5)
+```
+```{r}
+gaussInf=as.data.frame(influence.measures(gauss2)$is.inf)
+gaussInf[gaussInf$cook.d,]
+```
+No data point seems to be a statistical outlier...  
+No point is beyond Cook's distance 
+   
+   
+### Now just visually plot the regression -- see the estimate of each variable
+```{r}
+plot_models(gauss2, vline.color = "grey")
+```
+Percent of mothers who have smoked during any tiem pregnant is the only sig. indicator for likelyhood of being uninsured. (p <.001)
+  
+  
+## Predictive Approach
+```{r}
+set.seed(123)
+
+selection = createDataPartition(dataMap$pui,
+                                p = 0.75,
+                                list = FALSE)
+# traning dataset
+trainGauss = dataMap[ selection, ]
+
+# testing (validation) dataset
+testGauss  = dataMap[-selection, ]
+```
+
+Regress with the training dataset using cross validation to test 5 samples 
+```{r}
+ctrl = trainControl(method = 'cv',number = 5) #5 samples
+
+gauss2CV = train(hypo2,
+                 data = trainGauss, 
+                 method = 'glm',
+                 trControl = ctrl)
+
+gauss2CV
+```
+
+And now evaluate these sampled set back against the original data (testing dataset)
+```{r}
+predictedVal<-predict(gauss2CV,testGauss)
+
+postResample(obs = testGauss$pui,
+             pred=predictedVal)
+```
+The Rsquared < 0.5 meaining this is a good model 
+
+### Expalinatory Approach
+Re-make the first 2 hypothesis and run log regression for both...
+First need to make a binary variable out of percent uninsured (pui) -- predictive variable
+```{r}
+# create binary varaible 
+dataMap[, pui_binary := ifelse(pui > median(pui,na.rm = T), 1, 0)]
+
+# factor the predictive variable
+dataMap$pui=factor(dataMap$pui_binary)
+
+# hypothesis 1
+hypoDico1 <- formula(pui_binary~ noPCP_access)
+
+Logi1=glm(hypoDico1,
+           data = dataMap,
+           family = 'binomial')
+
+# hypothesis 2
+hypoDico2 <- formula(pui_binary~ noPCP_access + cost_of_care + mental_health + binge_drinking + maternal_smoke)
+
+Logi2=glm(hypoDico2,
+           data = dataMap,
+           family = 'binomial')
+```
+
+See hypotheses tests
+```{r}
+summary(Logi1)
+```
+
+```{r}
+summary(Logi2)
+```
+Comapre models
+```{r}
+lrtest(Logi1,Logi2)
+```
+The second test is better at predicing beign uninsured  (p<0.05)
+
+### Verify the situation of the model...
+
+Linearity Assumption
+```{r}
+DataRegLogis=dataMap
+DataRegLogis$PCP_accessTEST=dataMap$noPCP_access*log(dataMap$noPCP_access)
+DataRegLogis$carecostTEST=dataMap$cost_of_care*log(dataMap$cost_of_care)
+DataRegLogis$mentalhealthTEST=dataMap$mental_health*log(dataMap$mental_health)
+DataRegLogis$bingedrinkTEST=dataMap$binge_drinking*log(dataMap$binge_drinking)
+DataRegLogis$matersmokeTEST=dataMap$maternal_smoke*log(dataMap$maternal_smoke)
+
+DicoTest=formula(pui_binary~ noPCP_access + cost_of_care + mental_health + binge_drinking + maternal_smoke + 
+                   PCP_accessTEST + carecostTEST + mentalhealthTEST + bingedrinkTEST + matersmokeTEST)
+
+summary(glm(DicoTest,data=DataRegLogis,family = binomial))
+```
+```{r}
+vif(Logi2)
+```
+
+```{r}
+#visual expression
+plot(Logi2,5)
+```
+
+Now visualize the marginal effects of each indicator on health equity
+```{r}
+(modelChosen = margins(Logi2))
+```
+```{r}
+(margins=summary(modelChosen))
+```
+```{r}
+base <- ggplot(margins, 
+               aes(x=factor, y=AME)) + 
+  geom_point() + 
+  geom_errorbar(aes(ymin=lower, ymax=upper))
+
+plot_ME <- base + theme(axis.text.x = element_text(angle = 80, size = 6, hjust = 1))
+
+plot_ME   
+```
+
+### Predictive Approach
+Step 1: Split the data -- prep for regression 
+```{r}
+selection <- createDataPartition(dataMap$pui_binary, p = 0.75, list = FALSE)
+dataMap$pui_binary <- as.factor(dataMap$pui_binary)
+
+# create a training dataset and a testing dataset
+trainLogi = dataMap[selection, ]
+testLogi  = dataMap[-selection, ]
+```
+
+Step 2: Regress using 5 samples from the training data
+```{r}
+set.seed(123) #random seed
+
+ctrl = trainControl(method = 'cv', number = 5)
+
+Logis2CV = train(hypoDico2,
+                 data = trainLogi, 
+                 method = 'glm',
+                 family="binomial",
+                 trControl = ctrl)
+```
+
+```{r}
+Logis2CV
+```
+
+Step 3: See results & evaluate performance 
+```{r}
+predictions = predict(Logis2CV,
+                      newdata=testLogi,
+                      type='raw')
+
+# assess
+confusionMatrix(data=predictions,
+                reference=factor(testLogi$pui_binary),
+                positive = "1")
+```
+
+Unfortunately, with a p-value > 0.05 this model is not accurate.
